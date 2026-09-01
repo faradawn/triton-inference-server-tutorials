@@ -121,11 +121,18 @@ network access to huggingface.co at startup.
 
 ## Preparing the model repository
 
-Copy the four `llmapi` backend files from TensorRT-LLM's
-`triton_backend/all_models/llmapi/tensorrt_llm/` into a model repository:
+The Triton backend sources live in the
+[NVIDIA/TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) repository under
+`triton_backend/`; the standalone `tensorrtllm_backend` repository has been
+superseded. They are plain Python files and are not shipped in the
+`tensorrt_llm` wheel, so fetch them from a checkout.
+
+`triton_backend/all_models/llmapi/` contains exactly one model directory
+(`tensorrt_llm/`), so it doubles as a Triton model repository and needs no
+copying:
 
 ```
-model_repo/
+all_models/llmapi/          <- point --model-repository here
 └── tensorrt_llm/
     ├── config.pbtxt
     └── 1/
@@ -134,15 +141,24 @@ model_repo/
         └── model.yaml
 ```
 
-Note that the TensorRT-LLM Triton backend sources now live in the
-[NVIDIA/TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) repository under
-`triton_backend/`; the standalone `tensorrtllm_backend` repository has been
-superseded.
+> [!NOTE]
+> Until [NVIDIA/TensorRT-LLM#18381](https://github.com/NVIDIA/TensorRT-LLM/pull/18381)
+> merges, the `image_url` input and the `triton_config.multimodal` option below
+> exist only on that pull request's branch. Clone the fork shown here for now;
+> once it lands, clone `https://github.com/NVIDIA/TensorRT-LLM.git` instead.
 
-Only `1/model.yaml` needs editing:
+```bash
+git clone --depth 1 --branch feat/triton-llmapi-multimodal-image \
+    https://github.com/faradawn/TensorRT-LLM.git /workspace/trtllm-pr
+```
 
-```yaml
-model: /path/to/Qwen2.5-VL-3B-Instruct        # HF snapshot dir or HF model id
+Then point `1/model.yaml` at the model and turn on the multimodal opt-in. This
+edits the file in place inside the checkout, which leaves that clone's
+`git status` dirty — fine for a throwaway container:
+
+```bash
+cat > /workspace/trtllm-pr/triton_backend/all_models/llmapi/tensorrt_llm/1/model.yaml <<'EOF'
+model: Qwen/Qwen2.5-VL-3B-Instruct
 backend: "pytorch"
 tensor_parallel_size: 1
 kv_cache_config:
@@ -151,8 +167,12 @@ kv_cache_config:
 triton_config:
   max_batch_size: 0
   decoupled: False
-  multimodal: True      # opt-in; default False
+  multimodal: True
+EOF
 ```
+
+`model` accepts a Hugging Face model id (downloaded to `HF_HOME`) or a local
+snapshot directory.
 
 `triton_config.multimodal` defaults to `False`. This is deliberate: existing
 deployments that already declare their own `image_url` input keep their current
@@ -165,7 +185,8 @@ answer, so set it explicitly for multimodal models.
 In Slurm/MPI environments, launch through `trtllm-llmapi-launch`:
 
 ```bash
-trtllm-llmapi-launch tritonserver --model-repository=/path/to/model_repo \
+trtllm-llmapi-launch tritonserver \
+  --model-repository=/workspace/trtllm-pr/triton_backend/all_models/llmapi \
   --http-port=8000 --grpc-port=8001 --metrics-port=8002
 ```
 
@@ -208,6 +229,24 @@ chat JSON:
 | `sampling_param_exclude_input_from_output` | `BOOL` | `[1]` | Set to `true`; otherwise the rendered prompt is echoed back in `text_output`. |
 
 The only output is `text_output`.
+
+### Quick check with `curl`
+
+```bash
+curl -s http://localhost:8000/v2/models/tensorrt_llm/infer -H 'Content-Type: application/json' -d '{
+  "inputs": [
+    {"name":"text_input","shape":[1],"datatype":"BYTES","data":["What color is the bus and what does the sign say?"]},
+    {"name":"image_url","shape":[1],"datatype":"BYTES","data":["http://images.cocodataset.org/test2017/000000155781.jpg"]},
+    {"name":"sampling_param_max_tokens","shape":[1],"datatype":"INT32","data":[64]},
+    {"name":"sampling_param_exclude_input_from_output","shape":[1],"datatype":"BOOL","data":[true]}
+  ],
+  "outputs": [{"name":"text_output"}]
+}'
+```
+
+```json
+{"model_name":"tensorrt_llm","model_version":"1","outputs":[{"name":"text_output","datatype":"BYTES","shape":[1],"data":["The bus is yellow and white, and the sign on the bus says \"Out of Service.\""]}]}
+```
 
 ### Python client
 
