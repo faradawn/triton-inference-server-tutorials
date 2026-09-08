@@ -224,7 +224,7 @@ chat JSON:
 | Input | Datatype | Shape | Description |
 | ----- | -------- | ----- | ----------- |
 | `text_input` | `BYTES` | `[1]` | The plain question. The backend applies the chat template and inserts the per-architecture image placeholders, so do **not** add `<\|vision_start\|>` or similar tokens yourself. |
-| `image_url` | `BYTES` | `[N]` | One entry per image. Accepts an `http(s)` URL the server can reach, or an inline `data:image/...;base64,...` URI. See [Allowed scope of access](#allowed-scope-of-access). |
+| `image_url` | `BYTES` | `[N]` | One entry per image. Accepts `http(s)` URLs the server can reach; local paths and other schemes are rejected. |
 | `sampling_param_max_tokens` | `INT32` | `[1]` | Maximum number of tokens to generate. |
 | `sampling_param_exclude_input_from_output` | `BOOL` | `[1]` | Set to `true`; otherwise the rendered prompt is echoed back in `text_output`. |
 
@@ -315,29 +315,12 @@ ask(
 The model enumerates both images and describes each one in the order they were
 sent.
 
-### Image source equivalence
-
-A `data:image/...;base64,...` URI produces the same answer as the `http` URL for
-the same image, so you can pick whichever form fits your deployment. Inline data
-avoids a second network hop at the cost of a larger request body.
-
 ### Allowed scope of access
 
-`image_url` is client-controlled, so the backend accepts only:
-
-- `http://` and `https://` URLs the server can reach
-- inline `data:image/...;base64,...` URIs
-
-Local filesystem paths and `file://` URLs are **rejected**. Accepting them would
-let any caller make the server open image files its process can read, which on a
-client-accessible deployment is an arbitrary-file-read primitive. A rejected
-value fails the request with an error naming the offending entry; it does not
-silently fall back to a text-only answer.
-
-If your deployment needs to serve images that already live on the server, agree
-an explicit allowlisted root with whoever owns the deployment before widening
-this. Note this is deliberately narrower than `trtllm-serve`, whose media
-loading is unrestricted.
+`image_url` is client-controlled, so only `http(s)` URLs are accepted. Local
+filesystem paths, `file://` and other schemes are rejected, because accepting
+them would let a caller make the server read image files its process can open.
+Host images the model should see on a reachable web URL.
 
 ### Error behavior
 
