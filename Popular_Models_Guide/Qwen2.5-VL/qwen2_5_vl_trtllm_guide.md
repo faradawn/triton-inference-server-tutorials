@@ -34,31 +34,20 @@ Inference Server using the
 the [LLM API](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/README.md),
 exposed by Triton's `llmapi` backend.
 
-Unlike the deprecated multimodal path, there is **no engine build**: no
-`trtllm-build`, no separate visual engine. The model repository is four small
-files and the weights load straight from a Hugging Face snapshot at startup.
-
-> [!NOTE]
-> This guide replaces
-> [the Llava1.5 TensorRT-LLM guide](../Llava1.5/llava_trtllm_guide.md), which
-> uses the prebuilt-TensorRT-engine multimodal path that TensorRT-LLM declared
-> end-of-life in v1.2. See
-> [triton-inference-server/server#8945](https://github.com/triton-inference-server/server/issues/8945).
-
-This guide was tested with `Qwen/Qwen2.5-VL-3B-Instruct` on 1x NVIDIA B200,
-using `nvcr.io/nvidia/tritonserver:26.07-trtllm-python-py3`
-(Triton 2.71.0, TensorRT-LLM 1.2.1).
+It uses `nvcr.io/nvidia/tritonserver:26.07-trtllm-python-py3`, the latest
+`-trtllm-python-py3` container on NGC.
 
 ## Files provided with this guide
 
-The `llmapi` backend in TensorRT-LLM v1.2.1 does not accept image input yet;
-that is proposed in
-[NVIDIA/TensorRT-LLM#18381](https://github.com/NVIDIA/TensorRT-LLM/pull/18381).
-Two files here add it on top of v1.2.1, which is the exact TensorRT-LLM version
-installed in the container:
+The 26.07 container ships TensorRT-LLM v1.2.1, whose `llmapi` backend does not
+accept image input yet, so two files here add it for that version:
 
 1. [model.py](./model.py) - v1.2.1's backend plus the optional `image_url` input.
 2. [config.pbtxt](./config.pbtxt) - v1.2.1's config declaring `image_url`.
+
+Both are adapted from the image-input support now on TensorRT-LLM `main`. Once a
+container ships TensorRT-LLM v1.3.0 or newer, use the `model.py` and
+`config.pbtxt` from `main` directly and skip both files.
 
 The other two files in the model repository come from v1.2.1 unchanged.
 
@@ -80,9 +69,8 @@ docker run --rm -it --net host --shm-size=2g \
 
 ## Update the `openai` package
 
-The container ships `openai 1.107.3`, which is too old for
-`tensorrt_llm.serve`. Because the PyTorch executor imports that module
-unconditionally, **no** model loads on the `llmapi` backend until this is fixed:
+This container's `openai` is too old for `tensorrt_llm.serve`, so update it
+before loading a model:
 
 ```bash
 pip install --target=/workspace/pylibs -U openai
@@ -154,9 +142,6 @@ trtllm-llmapi-launch tritonserver \
   --http-port=8000 --grpc-port=8001 --metrics-port=8002
 ```
 
-`trtllm-llmapi-launch` is required: the LLM API spawns its workers with
-`MpiPoolSession`, and plain `tritonserver` fails with `MPI_ERR_SPAWN`.
-
 Startup takes about a minute. The server is ready when the log shows:
 
 ```
@@ -211,21 +196,3 @@ The only output is `text_output`.
 paths and `file://` are rejected, because accepting them would let a caller make
 the server read image files its process can open. Host images the model should
 see on a reachable web URL.
-
-## Troubleshooting
-
-| Symptom | Cause and fix |
-| ------- | ------------- |
-| `ImportError: cannot import name 'PartReasoningText'` | The container's `openai` is too old. See [Update the `openai` package](#update-the-openai-package). |
-| `mpi4py.MPI.Exception: MPI_ERR_SPAWN` | `tritonserver` was started directly; use `trtllm-llmapi-launch`. |
-| `cannot import name 'async_build_multimodal_prompt'` | `model.py` was taken from the #18381 branch rather than the copy provided here. That branch targets TensorRT-LLM 1.3 and calls a function the 1.2.1 wheel does not have. |
-| Answers ignore the image | `triton_config.multimodal` is not `True` in `model.yaml`. |
-| `Unsupported image_url '...'` | A local path or non-`http(s)` scheme was passed. |
-| `ConnectionRefusedError` from the client | The server is still starting; wait for `Started HTTPService`. |
-
-## References
-
-- [TensorRT-LLM LLM API](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/README.md)
-- [TensorRT-LLM supported models](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/models/supported-models.md)
-- [NVIDIA/TensorRT-LLM#18381](https://github.com/NVIDIA/TensorRT-LLM/pull/18381) - adds multimodal input to the Triton `llmapi` backend
-- [Qwen2.5-VL-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct)

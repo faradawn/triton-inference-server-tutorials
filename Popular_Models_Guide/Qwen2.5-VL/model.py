@@ -29,7 +29,8 @@
 #
 # This file is TensorRT-LLM v1.2.1's Triton `llmapi` backend
 #   triton_backend/all_models/llmapi/tensorrt_llm/1/model.py
-# with image input added, as proposed in NVIDIA/TensorRT-LLM#18381.
+# with image input added, backported from TensorRT-LLM main
+# (NVIDIA/TensorRT-LLM#18381).
 #
 # v1.2.1 is the TensorRT-LLM shipped in nvcr.io/nvidia/tritonserver:26.07-
 # trtllm-python-py3, so everything outside that feature matches the wheel
