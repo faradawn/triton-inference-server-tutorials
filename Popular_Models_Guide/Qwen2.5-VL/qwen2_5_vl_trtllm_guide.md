@@ -35,14 +35,23 @@ the [LLM API](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/
 exposed by Triton's `llmapi` backend.
 
 > [!IMPORTANT]
-> **This workflow depends on an unmerged TensorRT-LLM change.**
+> **This workflow depends on an unmerged TensorRT-LLM change, plus a small
+> patch to run it on today's container.**
+>
 > Image support in the Triton `llmapi` backend (the optional `image_url` input
 > and the `triton_config.multimodal` opt-in used below) is added by
 > [NVIDIA/TensorRT-LLM#18381](https://github.com/NVIDIA/TensorRT-LLM/pull/18381),
 > which has not been merged and is not present in any released TensorRT-LLM
-> version or container image. Until that PR lands you must build the
-> `llmapi` backend files from that branch; a stock container will not accept an
+> version or container image. Until that PR lands you must take the `llmapi`
+> backend files from that branch; a stock container will not accept an
 > `image_url` input.
+>
+> Those files call `async_build_multimodal_prompt`, which the same PR adds to
+> the `tensorrt_llm` **wheel**. The newest published container still ships
+> TensorRT-LLM 1.2.1, whose wheel does not have it, so
+> [one edit to `model.py`](#patching-modelpy-for-tensorrt-llm-121) is required
+> as well. Both steps go away once #18381 merges and a container ships with
+> that build of TensorRT-LLM.
 
 > [!NOTE]
 > This guide replaces
@@ -78,10 +87,15 @@ uses [`Qwen/Qwen2.5-VL-3B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-VL-3B-I
 | ---- | ----- |
 | Container | `nvcr.io/nvidia/tritonserver:26.07-trtllm-python-py3` |
 | Triton | 2.71.0 |
-| TensorRT-LLM | 1.2.1 |
+| TensorRT-LLM | 1.2.1 (with the [`model.py` patch](#patching-modelpy-for-tensorrt-llm-121)) |
+| torch | 2.10.0a0+b4e4ee81d3.nv25.12 |
 | CUDA | 13.1 |
 | Model | `Qwen/Qwen2.5-VL-3B-Instruct` |
 | Hardware | 1x NVIDIA B200 |
+
+Every command and every response below was run on that configuration. `26.07`
+is the newest `-trtllm-python-py3` tag; on it, the multimodal path does not work
+without the patch.
 
 ## Prerequisites
 
@@ -179,6 +193,108 @@ deployments that already declare their own `image_url` input keep their current
 behavior when they upgrade. The flip side is that if you forget to set it, any
 `image_url` values you send are **silently ignored** and you get a text-only
 answer, so set it explicitly for multimodal models.
+
+## Patching `model.py` for TensorRT-LLM 1.2.1
+
+> [!NOTE]
+> Skip this section entirely once a `-trtllm-python-py3` container ships with a
+> TensorRT-LLM build that includes
+> [#18381](https://github.com/NVIDIA/TensorRT-LLM/pull/18381). It is a bridge for
+> today's image, not part of the design.
+
+The files you just cloned build the prompt by calling
+`async_build_multimodal_prompt`, which #18381 adds to
+`tensorrt_llm/inputs/utils.py`. That module ships **inside the `tensorrt_llm`
+wheel**, not in the `triton_backend/` tree you cloned, so on a 1.2.1 container
+you have the caller but never the callee. The server still starts, still reports
+`multimodal input enabled`, and still answers text-only prompts — and then fails
+on every request that carries an image:
+
+```json
+{"error":"Error generating request: cannot import name 'async_build_multimodal_prompt' from 'tensorrt_llm.inputs' (/opt/venv-tritonserver/lib/python3.12/site-packages/tensorrt_llm/inputs/__init__.py)"}
+```
+
+1.2.1 also lacks everything that helper is built on — `MEDIA_IO_REGISTRY`,
+`ContentFormat`, `MultimodalDataTracker.item_order()`,
+`interleave_mm_placeholders` and `async_apply_chat_template` — so you cannot
+copy the new `utils.py` across either. What does work is replacing the single
+call with an equivalent written against the 1.2.1 API. Add this method to the
+`TritonPythonModel` class in
+`/workspace/trtllm-pr/triton_backend/all_models/llmapi/tensorrt_llm/1/model.py`,
+just above `async def _convert_request`:
+
+```python
+    async def _build_multimodal_prompt_121(self, text, media):
+        """Stand-in for `inputs.async_build_multimodal_prompt` on TRT-LLM 1.2.1.
+
+        1.2.1 has no `async_apply_chat_template` and no
+        `MultimodalDataTracker.item_order()`, and its
+        `add_multimodal_placeholders` takes three arguments rather than four.
+        """
+        from tensorrt_llm.inputs import prompt_inputs
+        from tensorrt_llm.inputs.utils import (ConversationMessage,
+                                               MultimodalDataTracker,
+                                               add_multimodal_placeholders,
+                                               apply_chat_template,
+                                               async_load_image)
+
+        mm_data_tracker = MultimodalDataTracker(self._mm_model_type)
+        for url in media:
+            mm_data_tracker.add_data("image", async_load_image(url))
+        mm_placeholder_counts = mm_data_tracker.placeholder_counts()
+
+        content = add_multimodal_placeholders(self._mm_model_type, text,
+                                              mm_placeholder_counts)
+        conversation = [
+            ConversationMessage(role="user", content=content, media=[])
+        ]
+        prompt_task = asyncio.to_thread(
+            apply_chat_template,
+            model_type=self._mm_model_type,
+            tokenizer=self._mm_tokenizer,
+            processor=self._mm_processor,
+            conversation=conversation,
+            add_generation_prompt=True,
+            mm_placeholder_counts=[mm_placeholder_counts],
+        )
+        prompt, (mm_data, _) = await asyncio.gather(
+            prompt_task, mm_data_tracker.retrieve_all_async())
+
+        prompt = prompt_inputs(prompt)
+        if mm_data:
+            prompt["multi_modal_data"] = mm_data
+        return prompt
+```
+
+`apply_chat_template` is synchronous and does real tokenizer work, so it goes
+through `asyncio.to_thread` rather than blocking the engine's event loop while
+the images are still downloading.
+
+Then, in `_convert_request`, point the call at it:
+
+```diff
+             image_url = get_input_tensor_by_name(request, 'image_url')
+             if image_url is not None and image_url.size > 0:
+-                from tensorrt_llm.inputs import async_build_multimodal_prompt
+-
+                 media = [
+                     url.decode("utf-8") if isinstance(url, bytes) else str(url)
+                     for url in image_url.reshape(-1)
+                 ]
+                 validate_media_urls(media)
+-                prompt = await async_build_multimodal_prompt(
+-                    model_type=self._mm_model_type,
+-                    tokenizer=self._mm_tokenizer,
+-                    processor=self._mm_processor,
+-                    prompt=prompt,
+-                    media=media,
+-                    modality="image",
+-                )
++                prompt = await self._build_multimodal_prompt_121(prompt, media)
+```
+
+Nothing else in the backend needs touching: `validate_media_urls` and the rest
+of the request path run unmodified on 1.2.1.
 
 ## Starting the server
 
@@ -300,20 +416,28 @@ The bus is yellow and white, and the sign on the bus says "Out of Service."
 ### Multiple images
 
 Pass more than one entry in `image_url`; the shape must match the number of
-entries:
+entries. Every entry must be an `http(s)` URL — see
+[Allowed scope of access](#allowed-scope-of-access):
 
 ```python
 ask(
     "Describe each image.",
     [
         "http://images.cocodataset.org/test2017/000000155781.jpg",
-        "/workspace/images/second.jpg",
+        "http://images.cocodataset.org/val2017/000000039769.jpg",
     ],
+    max_tokens=96,
 )
 ```
 
 The model enumerates both images and describes each one in the order they were
-sent.
+sent:
+
+```
+The first image depicts a bus on a foggy street at night. The bus has a sign on
+its front that reads "OUT OF SERVICE." ... The second image shows two cats lying
+on a pink couch.
+```
 
 ### Allowed scope of access
 
@@ -322,13 +446,19 @@ filesystem paths, `file://` and other schemes are rejected, because accepting
 them would let a caller make the server read image files its process can open.
 Host images the model should see on a reachable web URL.
 
+A rejected entry fails the whole request:
+
+```json
+{"error":"Error generating request: Unsupported image_url '/workspace/images/second.jpg': only http, https URLs are accepted."}
+```
+
 ### Error behavior
 
 An unreachable image URL surfaces as a Triton error rather than silently
-degrading to a text-only answer, for example:
+degrading to a text-only answer:
 
-```
-[trtllm] Error generating request: Cannot connect to host example.invalid:443
+```json
+{"error":"Error generating request: Cannot connect to host example.invalid:443 ssl:default [Name or service not known]"}
 ```
 
 ## Troubleshooting
@@ -339,6 +469,8 @@ degrading to a text-only answer, for example:
 | `ImportError: cannot import name 'PartReasoningText'` | The container's `openai` package is too old for `tensorrt_llm.serve`, which is imported unconditionally by the PyTorch executor. Install a newer `openai` into an overlay directory and export it on `PYTHONPATH` (see [Prerequisites](#known-issue-the-containers-openai-package-is-too-old)). |
 | `ConnectionRefusedError` from the client | The server is not up yet. Startup takes roughly 70 seconds; wait for `Started HTTPService` in the log, or poll until `curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/v2/health/ready` returns `200`. |
 | Images appear to be ignored and answers are text-only | `triton_config.multimodal` is not set to `True` in `1/model.yaml`. It defaults to `False` and image inputs are silently dropped. |
+| `cannot import name 'async_build_multimodal_prompt' from 'tensorrt_llm.inputs'`, only on requests carrying an image | The container's TensorRT-LLM wheel predates [#18381](https://github.com/NVIDIA/TensorRT-LLM/pull/18381). The server starts and text-only requests still work, which makes this easy to miss. Apply [the 1.2.1 patch](#patching-modelpy-for-tensorrt-llm-121). |
+| `Unsupported image_url '...': only http, https URLs are accepted.` | A local path, `file://` or other scheme was passed. Only `http(s)` is accepted; see [Allowed scope of access](#allowed-scope-of-access). |
 
 ## References
 
