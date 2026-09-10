@@ -34,8 +34,7 @@ Inference Server using the
 the [LLM API](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/README.md),
 exposed by Triton's `llmapi` backend.
 
-It uses `nvcr.io/nvidia/tritonserver:26.07-trtllm-python-py3`, the latest
-`-trtllm-python-py3` container on NGC.
+It uses `nvcr.io/nvidia/tritonserver:26.07-trtllm-python-py3`.
 
 ## Files provided with this guide
 
@@ -45,8 +44,7 @@ accept image input yet, so two files here add it for that version:
 1. [model.py](./model.py) - v1.2.1's backend plus the optional `image_url` input.
 2. [config.pbtxt](./config.pbtxt) - v1.2.1's config declaring `image_url`.
 
-Both are adapted from the image-input support now on TensorRT-LLM `main`. Once a
-container ships TensorRT-LLM v1.3.0 or newer, use the `model.py` and
+Once a Triton container ships TensorRT-LLM v1.3.0, we can copy `model.py` and
 `config.pbtxt` from `main` directly and skip both files.
 
 The other two files in the model repository come from v1.2.1 unchanged.
@@ -192,7 +190,5 @@ The model describes the images in the order they were sent.
 
 The only output is `text_output`.
 
-`image_url` is client-controlled, so only `http(s)` URLs are accepted. Local
-paths and `file://` are rejected, because accepting them would let a caller make
-the server read image files its process can open. Host images the model should
-see on a reachable web URL.
+`image_url` is client-controlled, so only `http(s)` URLs are accepted. Host
+images the model should see on a reachable web URL.
