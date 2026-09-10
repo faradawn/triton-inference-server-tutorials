@@ -47,11 +47,12 @@ exposed by Triton's `llmapi` backend.
 > `image_url` input.
 >
 > Those files call `async_build_multimodal_prompt`, which the same PR adds to
-> the `tensorrt_llm` **wheel**. The newest published container still ships
-> TensorRT-LLM 1.2.1, whose wheel does not have it, so
-> [one edit to `model.py`](#patching-modelpy-for-tensorrt-llm-121) is required
-> as well. Both steps go away once #18381 merges and a container ships with
-> that build of TensorRT-LLM.
+> the `tensorrt_llm` **wheel**. Every published `-trtllm-python-py3` image still
+> ships TensorRT-LLM 1.2.1, whose wheel does not have it, so
+> [a one-command patch](#patching-modelpy-for-tensorrt-llm-121) is required as
+> well. This guide is written for that combination and is verified end to end on
+> it; both steps go away only when a container ships a TensorRT-LLM that already
+> contains #18381.
 
 > [!NOTE]
 > This guide replaces
@@ -101,7 +102,14 @@ without the patch.
 
 ### Container
 
+Start from a clone of this repository, so that the
+[`trtllm_121_compat.py`](trtllm_121_compat.py) used below is mounted into the
+container along with it:
+
 ```bash
+git clone https://github.com/triton-inference-server/tutorials.git
+cd tutorials
+
 docker run --rm -it --gpus all --network host \
   -v ${PWD}:/workspace -w /workspace \
   nvcr.io/nvidia/tritonserver:26.07-trtllm-python-py3
@@ -161,9 +169,15 @@ all_models/llmapi/          <- point --model-repository here
 > exist only on that pull request's branch. Clone the fork shown here for now;
 > once it lands, clone `https://github.com/NVIDIA/TensorRT-LLM.git` instead.
 
+Only four files are needed, so skip the repository's Git LFS payload and check
+out the one directory — a few seconds and about 9 MB, rather than the ~900 MB a
+full clone pulls:
+
 ```bash
-git clone --depth 1 --branch feat/triton-llmapi-multimodal-image \
+GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --filter=blob:none --sparse \
+    --branch feat/triton-llmapi-multimodal-image \
     https://github.com/faradawn/TensorRT-LLM.git /workspace/trtllm-pr
+git -C /workspace/trtllm-pr sparse-checkout set triton_backend/all_models/llmapi
 ```
 
 Then point `1/model.yaml` at the model and turn on the multimodal opt-in. This
@@ -196,81 +210,47 @@ answer, so set it explicitly for multimodal models.
 
 ## Patching `model.py` for TensorRT-LLM 1.2.1
 
-> [!NOTE]
-> Skip this section entirely once a `-trtllm-python-py3` container ships with a
-> TensorRT-LLM build that includes
-> [#18381](https://github.com/NVIDIA/TensorRT-LLM/pull/18381). It is a bridge for
-> today's image, not part of the design.
-
-The files you just cloned build the prompt by calling
-`async_build_multimodal_prompt`, which #18381 adds to
+The backend files you just cloned build their prompt by calling
+`async_build_multimodal_prompt`, which
+[#18381](https://github.com/NVIDIA/TensorRT-LLM/pull/18381) adds to
 `tensorrt_llm/inputs/utils.py`. That module ships **inside the `tensorrt_llm`
-wheel**, not in the `triton_backend/` tree you cloned, so on a 1.2.1 container
-you have the caller but never the callee. The server still starts, still reports
-`multimodal input enabled`, and still answers text-only prompts — and then fails
-on every request that carries an image:
+wheel**, not in the `triton_backend/` tree you cloned, and the container's wheel
+is 1.2.1 — so you have the caller but never the callee.
+
+This is easy to miss, because nothing fails at startup. The server comes up, logs
+`multimodal input enabled`, and answers text-only prompts correctly. Only
+requests that actually carry an image fail:
 
 ```json
 {"error":"Error generating request: cannot import name 'async_build_multimodal_prompt' from 'tensorrt_llm.inputs' (/opt/venv-tritonserver/lib/python3.12/site-packages/tensorrt_llm/inputs/__init__.py)"}
 ```
 
-1.2.1 also lacks everything that helper is built on — `MEDIA_IO_REGISTRY`,
-`ContentFormat`, `MultimodalDataTracker.item_order()`,
-`interleave_mm_placeholders` and `async_apply_chat_template` — so you cannot
-copy the new `utils.py` across either. What does work is replacing the single
-call with an equivalent written against the 1.2.1 API. Add this method to the
-`TritonPythonModel` class in
-`/workspace/trtllm-pr/triton_backend/all_models/llmapi/tensorrt_llm/1/model.py`,
-just above `async def _convert_request`:
+Copying the new `utils.py` across does not help either: 1.2.1 lacks everything
+that helper is built on — `MEDIA_IO_REGISTRY`, `ContentFormat`,
+`MultimodalDataTracker.item_order()`, `interleave_mm_placeholders` and
+`async_apply_chat_template`. What does work is replacing that one call with an
+equivalent written against the 1.2.1 API. Run the script shipped next to this
+guide:
 
-```python
-    async def _build_multimodal_prompt_121(self, text, media):
-        """Stand-in for `inputs.async_build_multimodal_prompt` on TRT-LLM 1.2.1.
-
-        1.2.1 has no `async_apply_chat_template` and no
-        `MultimodalDataTracker.item_order()`, and its
-        `add_multimodal_placeholders` takes three arguments rather than four.
-        """
-        from tensorrt_llm.inputs import prompt_inputs
-        from tensorrt_llm.inputs.utils import (ConversationMessage,
-                                               MultimodalDataTracker,
-                                               add_multimodal_placeholders,
-                                               apply_chat_template,
-                                               async_load_image)
-
-        mm_data_tracker = MultimodalDataTracker(self._mm_model_type)
-        for url in media:
-            mm_data_tracker.add_data("image", async_load_image(url))
-        mm_placeholder_counts = mm_data_tracker.placeholder_counts()
-
-        content = add_multimodal_placeholders(self._mm_model_type, text,
-                                              mm_placeholder_counts)
-        conversation = [
-            ConversationMessage(role="user", content=content, media=[])
-        ]
-        prompt_task = asyncio.to_thread(
-            apply_chat_template,
-            model_type=self._mm_model_type,
-            tokenizer=self._mm_tokenizer,
-            processor=self._mm_processor,
-            conversation=conversation,
-            add_generation_prompt=True,
-            mm_placeholder_counts=[mm_placeholder_counts],
-        )
-        prompt, (mm_data, _) = await asyncio.gather(
-            prompt_task, mm_data_tracker.retrieve_all_async())
-
-        prompt = prompt_inputs(prompt)
-        if mm_data:
-            prompt["multi_modal_data"] = mm_data
-        return prompt
+```bash
+python3 /workspace/Popular_Models_Guide/Qwen2.5-VL/trtllm_121_compat.py \
+    /workspace/trtllm-pr/triton_backend/all_models/llmapi/tensorrt_llm/1/model.py
 ```
 
-`apply_chat_template` is synchronous and does real tokenizer work, so it goes
-through `asyncio.to_thread` rather than blocking the engine's event loop while
-the images are still downloading.
+```
+Patched .../llmapi/tensorrt_llm/1/model.py for TensorRT-LLM 1.2.1.
+```
 
-Then, in `_convert_request`, point the call at it:
+It edits nothing but that one file, refuses to write source that does not parse,
+and is safe to re-run — a second invocation reports `already patched; nothing to
+do`. If the call it looks for is gone, it says so and tells you how to check
+whether your container already has the function, rather than corrupting the
+model repository.
+
+### What the script changes
+
+It adds one method, `_build_multimodal_prompt_121`, and points the call site at
+it:
 
 ```diff
              image_url = get_input_tensor_by_name(request, 'image_url')
@@ -293,8 +273,28 @@ Then, in `_convert_request`, point the call at it:
 +                prompt = await self._build_multimodal_prompt_121(prompt, media)
 ```
 
+The new method does what the 1.3 helper does, in 1.2.1's vocabulary:
+
+| Step | 1.3 helper | 1.2.1 equivalent used here |
+| ---- | ---------- | -------------------------- |
+| download images | `MEDIA_IO_REGISTRY` | `async_load_image` per URL, gathered |
+| insert placeholders | `interleave_mm_placeholders`, `item_order()` | `add_multimodal_placeholders`, three-argument form |
+| render chat template | `async_apply_chat_template` | `apply_chat_template` via `asyncio.to_thread` |
+| build the prompt | returns `PromptInputs` | `prompt_inputs(...)` plus `multi_modal_data` |
+
+`apply_chat_template` is synchronous and does real tokenizer work, so it goes
+through `asyncio.to_thread` rather than blocking the engine's event loop while
+the images are still downloading. Read
+[`trtllm_121_compat.py`](trtllm_121_compat.py) for the full method.
+
 Nothing else in the backend needs touching: `validate_media_urls` and the rest
 of the request path run unmodified on 1.2.1.
+
+> [!NOTE]
+> Delete this step once a `-trtllm-python-py3` container ships a TensorRT-LLM
+> that already contains #18381. Note that #18381 merging is **not** enough on its
+> own — the 26.07 image's wheel stays at 1.2.1 no matter what lands upstream, so
+> the patch is needed until a *new image* ships.
 
 ## Starting the server
 
