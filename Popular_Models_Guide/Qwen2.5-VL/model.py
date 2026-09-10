@@ -32,8 +32,14 @@
 # with image input added, as proposed in NVIDIA/TensorRT-LLM#18381.
 #
 # v1.2.1 is the TensorRT-LLM shipped in nvcr.io/nvidia/tritonserver:26.07-
-# trtllm-python-py3, so this matches the wheel installed in the container.
-# Regenerate with tutorials/Popular_Models_Guide/Qwen2.5-VL, see the guide.
+# trtllm-python-py3, so everything outside that feature matches the wheel
+# installed in the container. To see exactly what was added:
+#
+#   git show v1.2.1:triton_backend/all_models/llmapi/tensorrt_llm/1/model.py \
+#       > /tmp/stock_model.py && diff /tmp/stock_model.py model.py
+#
+# The additions are `validate_media_urls`, `_init_multimodal`,
+# `_build_multimodal_prompt`, and the `image_url` block in `_convert_request`.
 # ---------------------------------------------------------------------------
 
 import asyncio
